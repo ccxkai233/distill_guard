@@ -1,0 +1,29 @@
+# 网关 + Redis 一把起。
+#   docker compose up -d          # 默认影子模式, 只记日志
+#   docker compose logs -f gateway
+# 开处置: 把 DG_SHADOW 改成 "0" 后 docker compose up -d
+services:
+  gateway:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DG_UPSTREAM: https://api.anthropic.com
+      DG_SHADOW: "1"                    # "0" 开处置
+      DG_REDIS_URL: redis://redis:6379
+      DG_FREE_PER_MIN: "6"
+      DG_FREE_PER_10S: "3"
+      DG_MIN_PASS_RATE: "0.03"
+      DG_SUSP_HALF_LIFE: "600"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:
