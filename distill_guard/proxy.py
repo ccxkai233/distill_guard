@@ -1,9 +1,15 @@
 """反向代理网关: 判定 -> (shadow 只记日志 | reject 返假错 | delay 抖动) -> 转发上游。
 
-只有 POST + JSON body 的请求走风控判定(补全类端点都是 POST);
-其余方法(GET /v1/models 之类)与非 JSON body 原样透传, 不进风控、不记状态。
+只有 POST + 非空 JSON 对象 body 的请求走风控判定(补全类端点都是 POST);
+其余方法(GET /v1/models 之类)、空 body、非 JSON / 非对象 body 一律原样透传,
+不进风控、不记状态。
 
 日志只记指纹和统计, 不落 prompt 原文。
+
+注意: 第三方依赖在模块顶层导入。因为本文件用了 PEP 563(from __future__ import
+annotations), 路由函数 relay 的 `request: Request` 注解会被延迟成字符串, FastAPI
+只能从**模块全局**里解析它 —— 所以 Request 必须在模块级可见, 不能只在函数内 import,
+否则每个请求都会被当成缺少必填 query 参数而返回 422。
 """
 
 from __future__ import annotations
@@ -12,6 +18,15 @@ import asyncio
 import json
 import logging
 import random
+from contextlib import asynccontextmanager
+
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
+
+from .guard import DistillGuard, GuardConfig
+from .state import MemoryState, RedisState
 
 log = logging.getLogger("distill_guard")
 
@@ -22,14 +37,6 @@ _HOP = {
 
 
 def create_app(upstream_base: str, redis_url: str | None = None, cfg=None):
-    from fastapi import FastAPI, Request
-    from fastapi.responses import JSONResponse, StreamingResponse
-    from starlette.background import BackgroundTask
-    import httpx
-
-    from .guard import DistillGuard, GuardConfig
-    from .state import MemoryState, RedisState
-
     if redis_url:
         import redis.asyncio as aioredis
 
@@ -41,10 +48,15 @@ def create_app(upstream_base: str, redis_url: str | None = None, cfg=None):
     guard = DistillGuard(state, cfg)
     client = httpx.AsyncClient(base_url=upstream_base, timeout=600.0)
 
-    app = FastAPI()
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        yield
+        await client.aclose()  # 关闭连接池, 释放上游连接
+
+    app = FastAPI(lifespan=lifespan)
     app.state.guard = guard
 
-    async def _forward(method: str, path: str, raw: bytes, request: "Request"):
+    async def _forward(method: str, path: str, raw: bytes, request: Request):
         headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP}
         upstream_req = client.build_request(
             method, "/" + path, content=raw, headers=headers,
@@ -59,6 +71,11 @@ def create_app(upstream_base: str, redis_url: str | None = None, cfg=None):
             background=BackgroundTask(upstream_resp.aclose),
         )
 
+    @app.get("/healthz")
+    async def healthz():
+        # 本地存活探针, 不转发上游。注册在 catch-all 之前才能命中。
+        return {"status": "ok", "shadow": cfg.shadow}
+
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
     async def relay(path: str, request: Request):
         raw = await request.body()
@@ -69,10 +86,12 @@ def create_app(upstream_base: str, redis_url: str | None = None, cfg=None):
 
         try:
             body = json.loads(raw)
-            if not isinstance(body, dict):
-                body = {}
         except Exception:
-            body = {}
+            body = None
+        # 非 JSON 对象或空对象不是补全请求, 直接透传, 不进风控
+        # (避免把 {} 当成"拆碎的小请求"误判为可疑)
+        if not isinstance(body, dict) or not body:
+            return await _forward("POST", path, raw, request)
 
         d = await guard.check(body)
         log.info(json.dumps({

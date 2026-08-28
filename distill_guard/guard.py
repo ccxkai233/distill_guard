@@ -13,7 +13,9 @@
        -> 模板可疑度只随时间半衰, 任何其他请求都稀释不了它;
           正常请求指纹不同, 根本碰不到可疑模板的状态。
   5. "很多报错是我主动返回的"
-       -> reject 动作由网关返回与上游逐字节一致的假错误, 请求不落上游。
+       -> reject 动作由网关直接返回一个仿真上游形态的错误体, 请求不落上游。
+          上线前应抓真实上游错误原文回填 upstream_error_body/status 使其尽量贴近,
+          注意经 JSONResponse 重新序列化后无法保证与上游逐字节一致(头部/格式会有差异)。
 """
 
 from __future__ import annotations
@@ -43,7 +45,7 @@ class GuardConfig:
     tiny_in_tokens: int = 400
     io_ratio: float = 8.0
 
-    # 伪装错误必须和真实上游错误逐字节一致, 上线前替换成实际抓到的原文
+    # 伪装错误应尽量贴近真实上游错误, 上线前用实际抓到的原文替换 body/status
     upstream_error_status: int = 529
     upstream_error_body: dict = field(
         default_factory=lambda: {
@@ -144,7 +146,7 @@ class DistillGuard:
         small_out = f.max_tokens is not None and f.max_tokens <= c.small_out_tokens
         harvest = f.in_tokens >= c.big_in_tokens and small_out       # 大输入小输出
         skew = f.max_tokens is not None and f.in_tokens >= c.io_ratio * f.max_tokens
-        shard = f.in_tokens <= c.tiny_in_tokens and f.n_messages <= 2  # 拆碎的小请求
+        shard = f.in_tokens <= c.tiny_in_tokens and 1 <= f.n_messages <= 2  # 拆碎的小请求(至少 1 条消息, 排除空 body)
         return harvest or skew or shard
 
     async def _load_susp(self, fp: str, now: float) -> float:
@@ -189,7 +191,9 @@ class DistillGuard:
 
         # 超出免费额度: 抬升该模板可疑度, 按比例小量放行
         susp = await self._raise_susp(fp, now, susp)
-        rate = max(self.cfg.min_pass_rate, free60 / n60e * (1.0 - 0.7 * susp))
+        # 上限钳到 1.0: 当仅 10s 突发超额(n60e<=free60)时 free60/n60e 会 >1,
+        # 作为"放行比例"必须 <=1。下限保留 min_pass_rate(小量放行)。
+        rate = min(1.0, max(self.cfg.min_pass_rate, free60 / n60e * (1.0 - 0.7 * susp)))
         if self.rng.random() < rate:
             return Decision("delay", True, fp, n10, n60e, susp, rate)
         return Decision("reject", True, fp, n10, n60e, susp, rate)

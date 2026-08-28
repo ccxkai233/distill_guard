@@ -6,7 +6,15 @@ services:
   gateway:
     build: .
     ports:
-      - "8080:8080"
+      # 默认只绑本机, 网关前面没有鉴权/TLS, 不要直接暴露到公网。
+      # 要对外提供服务, 改成 "8080:8080" 并在前面加反代 + 鉴权。
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     environment:
       DG_UPSTREAM: https://api.anthropic.com
       DG_SHADOW: "1"                    # "0" 开处置
